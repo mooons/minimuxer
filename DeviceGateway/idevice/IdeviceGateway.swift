@@ -75,6 +75,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var pairingFile: OpaquePointer? = nil
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
+    private let heartbeatLock = NSLock()
+    private var heartbeatClient: OpaquePointer?
 
     public override init() {
         try! super.init()
@@ -108,6 +110,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     public override func invalidateConnection() {
+        heartbeatLock.withLock {
+            if let heartbeatClient { heartbeat_client_free(heartbeatClient) }
+            heartbeatClient = nil
+        }
         debugLog("[IdeviceGateway] invalidateConnection() called - clearing stale adapter and handshake")
         if let handshake = handshake {
             rsd_handshake_free(handshake)
@@ -1343,32 +1349,51 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncPerformHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
-       debugLog("[IdeviceGateway] performHeartbeat() called, interval: \(interval)")
-       try verifyInitialized()
-       try performWithEitherService(
-           connectRP: heartbeat_connect_rsd,
-           connectLockdown: heartbeat_connect,
-           cleanup: heartbeat_client_free,
-           serviceName: "heartbeat"
-       ) { client in
-           verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")
-           let getErr = heartbeat_get_marco(client, interval, newInterval)
-           if let getErr = getErr {
-               let msg = self.getErrorMessage(from: getErr)
-               debugLog("[IdeviceGateway] performHeartbeat() heartbeat_get_marco failed: \(msg)")
-               defer { idevice_error_free(getErr) }
-               throw IdeviceGatewayError(.serviceError, reason: "Heartbeat receive failed, error: (\(msg))")
-           }
-           verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_send_polo")
-           let sendErr = heartbeat_send_polo(client)
-           if let sendErr = sendErr {
-               let msg = self.getErrorMessage(from: sendErr)
-               debugLog("[IdeviceGateway] performHeartbeat() heartbeat_send_polo failed: \(msg)")
-               defer { idevice_error_free(sendErr) }
-               throw IdeviceGatewayError(.serviceError, reason: "Heartbeat send failed, error: (\(msg))")
-           }
-           debugLog("[IdeviceGateway] performHeartbeat() succeeded, newInterval: \(newInterval.pointee)")
-       }
+        try verifyInitialized()
+        let receiveTimeout = pairingFileType == .lockdown ? min(interval, 55_000) + 5_000 : interval
+        let exchange: (OpaquePointer) throws -> Void = { client in
+            verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")
+            let getErr = heartbeat_get_marco(client, receiveTimeout, newInterval)
+            if let getErr = getErr {
+                let msg = self.getErrorMessage(from: getErr)
+                debugLog("[IdeviceGateway] performHeartbeat() heartbeat_get_marco failed: \(msg)")
+                defer { idevice_error_free(getErr) }
+                throw IdeviceGatewayError(.serviceError, reason: "Heartbeat receive failed, error: (\(msg))")
+            }
+            verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_send_polo")
+            let sendErr = heartbeat_send_polo(client)
+            if let sendErr = sendErr {
+                let msg = self.getErrorMessage(from: sendErr)
+                debugLog("[IdeviceGateway] performHeartbeat() heartbeat_send_polo failed: \(msg)")
+                defer { idevice_error_free(sendErr) }
+                throw IdeviceGatewayError(.serviceError, reason: "Heartbeat send failed, error: (\(msg))")
+            }
+            debugLog("[IdeviceGateway] performHeartbeat() succeeded, newInterval: \(newInterval.pointee)")
+        }
+        if pairingFileType == .lockdown {
+            // Keep this connection alive between Marco/Polo exchanges. Needs
+            // proper device testing; the iPad used a separate native workaround.
+            try heartbeatLock.withLock {
+                if heartbeatClient == nil {
+                    try performWithTcpService(connect: heartbeat_connect, cleanup: { _ in }, serviceName: "heartbeat") { client in
+                        heartbeatClient = client
+                    }
+                }
+                guard let client = heartbeatClient else {
+                    throw IdeviceGatewayError(.noConnection)
+                }
+                do {
+                    try exchange(client)
+                } catch {
+                    heartbeat_client_free(client)
+                    heartbeatClient = nil
+                    throw error
+                }
+            }
+        } else {
+            try performWithEitherService(connectRP: heartbeat_connect_rsd, connectLockdown: heartbeat_connect,
+                                         cleanup: heartbeat_client_free, serviceName: "heartbeat", action: exchange)
+        }
     }
 
     private func syncMountPersonalizedDdi(image: Data, trustcache: Data, manifest: Data) throws {

@@ -89,6 +89,11 @@ final internal class NetworkObserverService: NetworkObserverAPI, @unchecked Send
     }
     
     func refreshEndpoint() async {
+        // Configuration is bound before the pairing file is loaded. Probing
+        // .unknown can select the Remote Pairing port for a Lockdown device.
+        guard await self.connectionManager.gateway.pairingFileType != .unknown else {
+            return
+        }
         let manager = self.connectionManager
         verboseLog("[minimuxer] [net] refreshing interfaces list and peers")
         let ifacesChanged = await manager.refresh()

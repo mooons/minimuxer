@@ -62,6 +62,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
 
         self.network.onNetworkChanged = { [weak self] in
             guard let self = self else { return }
+            await self.heartbeat.invalidateReadiness()
             let readyResult = await self.isReady()
             debugLog("[minimuxer] [net] publishing status update to subscribers")
             self.statusSubject.send(readyResult)
@@ -220,10 +221,13 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         return .success(true)
     } 
 
-    private func runWithChecks<T: Sendable>(_ context: String, catchAll: @escaping (String) -> MinimuxerError, action: @escaping @Sendable () async throws -> T) async throws(MinimuxerError) -> T {
+    private func runWithChecks<T: Sendable>(_ context: String, requiresHeartbeat: Bool = true, catchAll: @escaping (String) -> MinimuxerError, action: @escaping @Sendable () async throws -> T) async throws(MinimuxerError) -> T {
         do {
             return try await matchingPriority {
-                try await action()
+                if requiresHeartbeat {
+                    try await self.heartbeat.waitUntilReady()
+                }
+                return try await action()
             }
         } catch let err as DeviceGatewayError {
             throw err.asMinimuxerError(protocol: activeProtocol, catchAll: catchAll)
@@ -290,8 +294,6 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         if DeviceConnectionMode.notConfigured == connectionMode {
             throw connectionNotConfiguredError()
         }
-        await self.network.start()
-
         // actor serialization scope
         await state.with{
             $0.status = .inprogress     // mark inprogress
@@ -299,7 +301,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             $0.preferredProtocol = preferred
         }
         // let idevice initialize its state
-        try await runWithChecks("while starting gateway", catchAll: { .invalidPairing(protocol: self.activeProtocol, reason: $0) }) {
+        try await runWithChecks("while starting gateway", requiresHeartbeat: false, catchAll: { .invalidPairing(protocol: self.activeProtocol, reason: $0) }) {
             try await self.gateway.start(pairingFileContent: pairingFile, preferred: preferred)
         }
         if self.gateway.requiresUsbmuxd {
@@ -308,6 +310,12 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // start our fake usbmuxd server for clients if required
             try await restartMuxerServer()
         }
+
+        // Resolve the endpoint using the loaded protocol, including when the
+        // VPN was already connected and no new path event will arrive.
+        await self.network.refreshEndpoint()
+        await self.network.start()
+        await self.heartbeat.start()
         
         // mark ready!
         await state.with{
@@ -325,10 +333,11 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             return task
         }
         _ = await oldTask?.result       // await cancelled mount task completion
+        await self.heartbeat.stop()
         if self.gateway.requiresUsbmuxd {
             await self.proxyServer.stop()
         }
-        try await runWithChecks("while stopping gateway", catchAll: MinimuxerError.close) {
+        try await runWithChecks("while stopping gateway", requiresHeartbeat: false, catchAll: MinimuxerError.close) {
             try await self.gateway.stop()
         }
         // mark ready!

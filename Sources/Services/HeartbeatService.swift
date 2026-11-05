@@ -10,126 +10,127 @@ import Foundation
 internal import MinimuxerCommon
 internal import DeviceGatewayAPI
 
-final internal class HeartbeatService {
+final internal class HeartbeatService: @unchecked Sendable {
     let deviceProvider: DeviceProvider
-    var gateway: any DeviceGatewayAPI {
-        deviceProvider.gateway
-    }
+    var gateway: any DeviceGatewayAPI { deviceProvider.gateway }
     let proxyServer: UsbmuxdProxyServer
     let endpoint: DeviceEndpoint
-
-    private let sleepNs: UInt64 = MinimuxerConstants.heartbeatInterval * 1_000_000
+    private let sleepNs = MinimuxerConstants.heartbeatInterval * 1_000_000
+    private var lastErrorDescription: String?
 
     init(deviceProvider: DeviceProvider, proxyServer: UsbmuxdProxyServer, endpoint: DeviceEndpoint) {
         self.deviceProvider = deviceProvider
         self.proxyServer = proxyServer
         self.endpoint = endpoint
     }
-    
+
     private actor MutableState {
         var running = false
-        var taskActive = false
+        private var task: Task<Void, Never>?
+        private var lastSuccess: Date?
+        private var successfulIP: String?
 
-        func tryStart() -> Bool {
-            if taskActive {
-                running = true
-                return false
-            }
+        func start(_ loop: @escaping @Sendable () async -> Void) {
+            guard task == nil else { return }
             running = true
-            taskActive = true
-            return true
+            task = Task.detached {
+                await loop()
+                await self.terminate()
+            }
         }
 
-        func stop() {
+        func requestStop() -> Task<Void, Never>? {
             running = false
+            invalidate()
+            task?.cancel()
+            return task
         }
 
-        func terminate() {
-            taskActive = false
+        func invalidate() {
+            lastSuccess = nil
+            successfulIP = nil
+        }
+
+        func succeeded(ip: String) {
+            guard running else { return }
+            lastSuccess = Date()
+            successfulIP = ip
+        }
+
+        func isReady(ip: String) -> Bool {
+            guard running, successfulIP == ip, let lastSuccess else { return false }
+            return Date().timeIntervalSince(lastSuccess) < 30
+        }
+
+        private func terminate() {
             running = false
+            task = nil
+            invalidate()
         }
     }
 
     private let state = MutableState()
-    private var lastErrorDescription: String?
 
-    var lastBeatSuccessful = false
+    // The workaround was reproduced with idevice's direct Lockdown transport.
+    // Other backends and Remote Pairing keep their existing service behavior.
+    private var needsHeartbeat: Bool {
+        gateway.pairingFileType == .lockdown && !gateway.requiresUsbmuxd
+    }
 
-    // Start the heartbeat loop. ignored if a task is already active.
     func start() async {
-        guard await state.tryStart() else {
-            return
-        }
-
-        verboseLog("[minimuxer] Starting heartbeat task...")
-        Task.detached { [weak self] in
-            guard let self = self else { return }
-            verboseLog("[minimuxer] heartbeat-task: started")
-
-            await self.heartbeatLoop()
-
-            await self.state.terminate()
-            self.lastBeatSuccessful = false
-            verboseLog("[minimuxer] heartbeat-task: stopped")
+        guard needsHeartbeat else { return }
+        await state.start { [weak self] in
+            await self?.heartbeatLoop()
         }
     }
 
-    // Signal the heartbeat task to stop. will exit on next iteration.
     func stop() async {
-        await state.stop()
-        lastBeatSuccessful = false
-        verboseLog("[minimuxer] HeartbeatService stop requested")
+        let task = await state.requestStop()
+        // The gateway owns native handles; drain its current exchange before
+        // stop/restart can free pairing data or replace the gateway.
+        await task?.value
     }
 
-    private func logIfNeeded(_ message: String, isVerbose: Bool = false) {
-        if message != lastErrorDescription {
-            if isVerbose {
-                verboseLog("[minimuxer] heartbeat-task: \(message)")
-            } else {
-                debugLog("[minimuxer] heartbeat-task: \(message)")
+    func invalidateReadiness() async {
+        await state.invalidate()
+    }
+
+    func waitUntilReady(timeout: TimeInterval = 5) async throws {
+        guard needsHeartbeat else { return }
+        await start()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            if let ip = try? await endpoint.ip(), await state.isReady(ip: ip) {
+                return
             }
-            lastErrorDescription = message
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
+        throw MinimuxerError.noDevice("Lockdown heartbeat did not become ready before opening a device service")
     }
 
     private func heartbeatLoop() async {
-        if self.gateway.requiresUsbmuxd {
-            while !self.proxyServer.isListening {
-                logIfNeeded("Waiting for usbmuxd to be ready...", isVerbose: true)
-                try? await Task.sleep(nanoseconds: sleepNs)
-            }
-            verboseLog("[minimuxer] heartbeat-task: usbmuxd is ready")
-        }
-
-        var currentInterval: UInt64 = MinimuxerConstants.heartbeatInterval
-
-        while await state.running {
-            let tunnelPeerIp: String
+        var currentInterval = MinimuxerConstants.heartbeatInterval
+        while await state.running && !Task.isCancelled {
+            guard needsHeartbeat else { break }
             do {
-                tunnelPeerIp = try await self.endpoint.ip()
+                let ip = try await endpoint.ip()
+                guard NetworkUtils.testTCP(ip: ip, port: gateway.servicePort) else {
+                    throw MinimuxerError.noDevice("Lockdown endpoint is not reachable")
+                }
+                currentInterval = try await gateway.performHeartbeat(interval: currentInterval)
+                if !Task.isCancelled {
+                    await state.succeeded(ip: ip)
+                    lastErrorDescription = nil
+                }
             } catch {
-                logIfNeeded("device IP unavailable", isVerbose: true)
-                lastBeatSuccessful = false
-                try? await Task.sleep(nanoseconds: sleepNs)
-                continue
-            }
-            
-            // verify tunnel/device reachability first
-            let targetPort = self.gateway.servicePort
-            if !NetworkUtils.testTCP(ip: tunnelPeerIp, port: targetPort) {
-                logIfNeeded("device IP not reachable, waiting...", isVerbose: true)
-                lastBeatSuccessful = false
-                try? await Task.sleep(nanoseconds: sleepNs)
-                continue
-            }
-
-            do {
-                currentInterval = try await self.gateway.performHeartbeat(interval: currentInterval)
-                lastBeatSuccessful = true
-                lastErrorDescription = nil
-            } catch {
-                logIfNeeded("Heartbeat failed: \(error)")
-                lastBeatSuccessful = false
+                await state.invalidate()
+                if Task.isCancelled { break }
+                let description = String(describing: error)
+                if description != lastErrorDescription {
+                    debugLog("[minimuxer] heartbeat-task: \(description)")
+                    lastErrorDescription = description
+                }
                 try? await Task.sleep(nanoseconds: sleepNs)
             }
         }
